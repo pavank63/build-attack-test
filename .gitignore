@@ -1,0 +1,8 @@
+sdists-repo/
+wheels-repo/
+work-dir/
+test_env/
+*.egg-info/
+dist/
+build/
+__pycache__/
