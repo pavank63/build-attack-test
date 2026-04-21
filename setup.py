@@ -6,7 +6,12 @@ build backend can access. Each probe prints PASS (attack succeeded)
 or BLOCKED (attack failed).
 """
 
+import os
 import sys
+
+# setuptools runs setup.py via exec() and the source root may not
+# be on sys.path. Add it so the probes package is importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from probes import SEPARATOR
 from probes import (

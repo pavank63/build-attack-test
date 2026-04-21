@@ -1,0 +1,3 @@
+include setup.py
+recursive-include probes *.py
+recursive-include src *.py
