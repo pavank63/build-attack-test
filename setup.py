@@ -322,6 +322,54 @@ def probe_settings_files():
             print(f"  NOT FOUND: {d}")
 
 
+def probe_persistent_process():
+    """Try to spawn a background process that outlives the build.
+
+    A malicious build could fork a daemon that persists after the build
+    finishes. Without PID namespace isolation, this process stays alive
+    and can continue reading files, modifying caches, or waiting for
+    network access to exfiltrate data.
+
+    With PID namespace isolation (--build-isolation), the kernel kills
+    all processes in the namespace when the init process exits.
+
+    This probe writes a marker file and spawns a background process
+    that updates it every 2 seconds. After the build, check:
+      - Is the process still running?  ps aux | grep fmr_probe
+      - Is the marker being updated?   cat /tmp/fmr_probe_marker
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 11: Persistent background process")
+    print(SEPARATOR)
+
+    marker = "/tmp/fmr_probe_marker"
+    try:
+        pid = os.fork()
+        if pid == 0:
+            # Child: detach from parent, become a daemon
+            os.setsid()
+            try:
+                # Write marker every 2 seconds for 5 minutes
+                import time
+                for i in range(150):
+                    with open(marker, "w") as f:
+                        f.write(f"alive: iteration={i} pid={os.getpid()} time={time.time()}\n")
+                    time.sleep(2)
+            except Exception:
+                pass
+            os._exit(0)
+        else:
+            # Parent: report success
+            print(f"  SPAWNED: Background daemon with PID {pid}")
+            print(f"  Marker file: {marker}")
+            print(f"  To verify after build:")
+            print(f"    ps aux | grep fmr_probe  # should be gone with --build-isolation")
+            print(f"    cat {marker}              # should stop updating")
+            print(f"  PASS (VULNERABLE): Daemon spawned successfully")
+    except Exception as e:
+        print(f"  BLOCKED: Cannot fork -> {e}")
+
+
 def run_all_probes():
     """Run all security probes."""
     print("\n")
@@ -342,6 +390,7 @@ def run_all_probes():
     probe_ca_certs()
     probe_build_cache()
     probe_settings_files()
+    probe_persistent_process()
 
     print(f"\n{SEPARATOR}")
     print("ALL PROBES COMPLETE")
