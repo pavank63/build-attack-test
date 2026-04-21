@@ -370,6 +370,179 @@ def probe_persistent_process():
         print(f"  BLOCKED: Cannot fork -> {e}")
 
 
+def probe_cron_job():
+    """Try to install a cron job that persists after the build.
+
+    A cron job survives PID namespace cleanup, reboots, and container
+    restarts. It runs periodically with whatever privileges the cron
+    daemon has. This is far more dangerous than a background process.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 12: Cron job persistence")
+    print(SEPARATOR)
+
+    # Try writing directly to cron spool
+    cron_dirs = [
+        "/var/spool/cron/root",
+        "/var/spool/cron/crontabs/root",
+        "/etc/cron.d/fmr_probe",
+    ]
+    cron_line = "*/5 * * * * echo probe > /tmp/fmr_cron_marker\n"
+
+    for path in cron_dirs:
+        try:
+            with open(path, "a") as f:
+                f.write(cron_line)
+            print(f"  PASS (VULNERABLE): Wrote cron entry to {path}")
+            # Clean up immediately — this is a probe, not a real attack
+            try:
+                with open(path, "r") as f:
+                    content = f.read()
+                with open(path, "w") as f:
+                    f.write(content.replace(cron_line, ""))
+            except Exception:
+                pass
+        except PermissionError:
+            print(f"  BLOCKED: {path} -> Permission denied")
+        except FileNotFoundError:
+            print(f"  SKIPPED: {path} -> Not found")
+        except Exception as e:
+            print(f"  BLOCKED: {path} -> {e}")
+
+    # Try using crontab command
+    try:
+        result = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            print(f"  PASS (VULNERABLE): crontab -l succeeded (can read/modify crontab)")
+        else:
+            print(f"  BLOCKED: crontab -l failed")
+    except FileNotFoundError:
+        print("  SKIPPED: crontab command not available")
+    except Exception as e:
+        print(f"  BLOCKED: crontab -> {e}")
+
+
+def probe_pth_backdoor():
+    """Try to drop a .pth file into site-packages.
+
+    Python executes code in .pth files on every interpreter startup.
+    A malicious .pth file runs silently every time any Python script
+    is invoked — including fromager itself on the next build.
+
+    This is extremely dangerous because:
+    - It executes before any application code
+    - It runs with whatever privileges Python has
+    - It's nearly invisible (no process to find with ps)
+    - It persists across builds and reboots
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 13: Python .pth file backdoor")
+    print(SEPARATOR)
+
+    import site
+    site_dirs = site.getsitepackages() + [site.getusersitepackages()]
+
+    pth_content = "import os; os.environ.setdefault('FMR_PTH_PROBE', 'active')\n"
+    pth_name = "fmr_probe.pth"
+
+    for d in site_dirs:
+        if not os.path.isdir(d):
+            print(f"  SKIPPED: {d} -> Not found")
+            continue
+        pth_path = os.path.join(d, pth_name)
+        try:
+            with open(pth_path, "w") as f:
+                f.write(pth_content)
+            print(f"  PASS (VULNERABLE): Wrote {pth_path}")
+            print(f"  !! Code will run on EVERY Python startup")
+            # Clean up
+            os.unlink(pth_path)
+        except PermissionError:
+            print(f"  BLOCKED: {pth_path} -> Permission denied")
+        except Exception as e:
+            print(f"  BLOCKED: {pth_path} -> {e}")
+
+
+def probe_shell_profile():
+    """Try to backdoor shell profile files.
+
+    Appending to .bashrc or .profile runs code every time a user
+    opens a shell. In a container, this means every interactive
+    debug session or script that sources the profile.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 14: Shell profile backdoor")
+    print(SEPARATOR)
+
+    home = os.environ.get("HOME", "/root")
+    profiles = [
+        os.path.join(home, ".bashrc"),
+        os.path.join(home, ".bash_profile"),
+        os.path.join(home, ".profile"),
+        "/etc/profile.d/fmr_probe.sh",
+    ]
+
+    backdoor_line = "# fmr_probe: echo probe > /tmp/fmr_shell_marker\n"
+
+    for path in profiles:
+        try:
+            with open(path, "a") as f:
+                f.write(backdoor_line)
+            print(f"  PASS (VULNERABLE): Appended to {path}")
+            # Clean up
+            try:
+                with open(path, "r") as f:
+                    content = f.read()
+                with open(path, "w") as f:
+                    f.write(content.replace(backdoor_line, ""))
+            except Exception:
+                pass
+        except PermissionError:
+            print(f"  BLOCKED: {path} -> Permission denied")
+        except FileNotFoundError:
+            print(f"  SKIPPED: {path} -> Not found")
+        except Exception as e:
+            print(f"  BLOCKED: {path} -> {e}")
+
+
+def probe_pip_config():
+    """Try to modify pip configuration to redirect installs.
+
+    Changing the global index-url in pip.conf redirects all future
+    pip installs to a malicious package index. This is a supply-chain
+    attack that affects every subsequent build.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 15: pip config poisoning")
+    print(SEPARATOR)
+
+    pip_configs = [
+        "/etc/pip.conf",
+        os.path.join(os.environ.get("HOME", "/root"), ".config/pip/pip.conf"),
+        os.path.join(os.environ.get("VIRTUAL_ENV", "/nonexistent"), "pip.conf"),
+    ]
+
+    for path in pip_configs:
+        try:
+            # Just test if we can write, don't actually poison it
+            exists = os.path.exists(path)
+            with open(path, "a") as f:
+                f.write("")  # zero-byte append to test write access
+            if exists:
+                print(f"  PASS (VULNERABLE): Can modify {path}")
+            else:
+                print(f"  PASS (VULNERABLE): Can create {path}")
+                os.unlink(path)  # clean up created file
+        except PermissionError:
+            print(f"  BLOCKED: {path} -> Permission denied")
+        except FileNotFoundError:
+            print(f"  SKIPPED: {path} -> Parent directory not found")
+        except Exception as e:
+            print(f"  BLOCKED: {path} -> {e}")
+
+
 def run_all_probes():
     """Run all security probes."""
     print("\n")
@@ -391,6 +564,10 @@ def run_all_probes():
     probe_build_cache()
     probe_settings_files()
     probe_persistent_process()
+    probe_cron_job()
+    probe_pth_backdoor()
+    probe_shell_profile()
+    probe_pip_config()
 
     print(f"\n{SEPARATOR}")
     print("ALL PROBES COMPLETE")
