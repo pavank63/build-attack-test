@@ -6,6 +6,8 @@ several attack vectors that build isolation should block.
 
 Each probe prints PASS (attack succeeded = vulnerable) or
 BLOCKED (attack failed = isolated).
+
+Targets are based on the real RHEL AI builder environment.
 """
 
 import os
@@ -15,24 +17,34 @@ import sys
 
 SEPARATOR = "=" * 60
 
+
 def probe_netrc():
-    """Try to read .netrc credential files."""
+    """Try to read .netrc credential files.
+
+    In the builder container, .netrc is mounted at
+    /opt/app-root/src/.netrc (mode 600, root:root) and contains
+    GitLab PAT tokens for package index access.
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 1: Credential file access (.netrc)")
     print(SEPARATOR)
 
     paths = [
+        # Builder container mounts .netrc here via --mount=type=secret
+        "/opt/app-root/src/.netrc",
+        # Standard Unix locations
         os.path.expanduser("~/.netrc"),
         "/root/.netrc",
-        "/opt/app-root/src/.netrc",
     ]
 
     for path in paths:
         try:
             with open(path) as f:
                 content = f.read()
-            # Don't print actual content, just confirm access
             print(f"  PASS (VULNERABLE): Read {path} ({len(content)} bytes)")
+            # Check if it looks like real credentials
+            if "machine" in content and "password" in content:
+                print(f"  !! Contains machine/password entries")
         except PermissionError:
             print(f"  BLOCKED: {path} -> Permission denied")
         except FileNotFoundError:
@@ -42,34 +54,59 @@ def probe_netrc():
 
 
 def probe_env_vars():
-    """Try to read sensitive environment variables."""
+    """Try to read sensitive environment variables.
+
+    These are real variables present in the builder environment:
+    - NETRC: overrides .netrc location
+    - TWINE_PASSWORD: set by gaudi_mirror plugin from .netrc
+    - TWINE_USERNAME: set alongside TWINE_PASSWORD
+    - CI_JOB_TOKEN: GitLab CI built-in token
+    - CI_REGISTRY_PASSWORD: container registry auth
+    - BOT_PAT: GitLab personal access token for the build bot
+    - NGC_API_KEY: NVIDIA GPU Cloud API key
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 2: Sensitive environment variables")
     print(SEPARATOR)
 
-    targets = [
-        "NETRC",
-        "NGC_API_KEY",
-        "TWINE_PASSWORD",
-        "CI_JOB_TOKEN",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "PYPI_TOKEN",
-    ]
+    # Grouped by source
+    targets = {
+        # GitLab CI/CD tokens
+        "CI_JOB_TOKEN": "GitLab CI job token",
+        "CI_REGISTRY_PASSWORD": "Container registry password",
+        "BOT_PAT": "GitLab bot personal access token",
+        # Credential file pointers
+        "NETRC": ".netrc file path override",
+        # Package upload credentials (set by gaudi_mirror plugin)
+        "TWINE_USERNAME": "PyPI/GitLab upload username",
+        "TWINE_PASSWORD": "PyPI/GitLab upload password",
+        # Vendor API keys
+        "NGC_API_KEY": "NVIDIA GPU Cloud API key",
+        # Build system internals
+        "FROMAGER_ARGS": "Arbitrary fromager CLI arguments",
+        "WHEEL_SERVER_PROJECT_PATH": "GitLab wheel index project path",
+        "TOOL_SERVER_URL": "Package index URL for tools",
+        # Generic sensitive vars
+        "GH_TOKEN": "GitHub token",
+        "GITHUB_TOKEN": "GitHub token",
+        "AWS_SECRET_ACCESS_KEY": "AWS secret key",
+    }
 
-    for var in targets:
+    for var, description in targets.items():
         val = os.environ.get(var)
         if val:
-            # Mask value, just show it exists
             masked = val[:4] + "****" if len(val) > 4 else "****"
-            print(f"  PASS (VULNERABLE): ${var} = {masked}")
+            print(f"  PASS (VULNERABLE): ${var} ({description}) = {masked}")
         else:
-            print(f"  BLOCKED/ABSENT: ${var} not set")
+            print(f"  BLOCKED/ABSENT: ${var} ({description})")
 
 
 def probe_network():
-    """Try to reach the network."""
+    """Try to reach the network.
+
+    A malicious build could exfiltrate stolen credentials to an
+    external server. Test both DNS and direct TCP.
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 3: Network access")
     print(SEPARATOR)
@@ -81,7 +118,7 @@ def probe_network():
     except (socket.gaierror, OSError) as e:
         print(f"  BLOCKED: DNS resolution failed -> {e}")
 
-    # TCP connection
+    # TCP connection to external host
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -91,9 +128,21 @@ def probe_network():
     except (ConnectionRefusedError, OSError) as e:
         print(f"  BLOCKED: TCP connection failed -> {e}")
 
+    # Try reaching GitLab (where credentials would be most useful)
+    try:
+        addr = socket.getaddrinfo("gitlab.com", 443)[0][4][0]
+        print(f"  PASS (VULNERABLE): DNS resolved gitlab.com -> {addr}")
+    except (socket.gaierror, OSError) as e:
+        print(f"  BLOCKED: gitlab.com DNS failed -> {e}")
+
 
 def probe_processes():
-    """Try to see other processes."""
+    """Try to see other processes.
+
+    Without PID isolation, a build can see all processes including
+    other parallel builds, fromager itself, and any credential-
+    handling processes.
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 4: Process visibility (PID namespace)")
     print(SEPARATOR)
@@ -103,9 +152,9 @@ def probe_processes():
             ["ps", "aux"], capture_output=True, text=True, timeout=5
         )
         lines = result.stdout.strip().split("\n")
-        # In a PID namespace, we should only see our own processes
-        print(f"  Visible processes: {len(lines) - 1}")  # minus header
-        if len(lines) > 5:
+        count = len(lines) - 1  # minus header
+        print(f"  Visible processes: {count}")
+        if count > 5:
             print("  PASS (VULNERABLE): Can see many processes")
         else:
             print("  BLOCKED: Only own processes visible (PID isolated)")
@@ -120,7 +169,11 @@ def probe_processes():
 
 
 def probe_ipc():
-    """Try to access shared IPC resources."""
+    """Try to access shared IPC resources.
+
+    Shared memory segments and semaphores from other builds or
+    system services are visible without IPC isolation.
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 5: IPC namespace isolation")
     print(SEPARATOR)
@@ -130,7 +183,6 @@ def probe_ipc():
             ["ipcs", "-a"], capture_output=True, text=True, timeout=5
         )
         lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
-        # In an isolated IPC namespace, there should be no shared segments
         has_segments = any(
             l.startswith("0x") or l[0:1].isdigit()
             for l in lines
@@ -148,7 +200,10 @@ def probe_ipc():
 
 
 def probe_hostname():
-    """Check if hostname is isolated."""
+    """Check if hostname is isolated.
+
+    Real hostname leaks the build machine identity.
+    """
     print(f"\n{SEPARATOR}")
     print("PROBE 6: UTS namespace (hostname)")
     print(SEPARATOR)
@@ -174,12 +229,107 @@ def probe_uid():
     print(f"  HOME={os.environ.get('HOME', 'unset')}")
 
 
+def probe_ca_certs():
+    """Try to read CA certificates and RPM GPG keys.
+
+    The builder installs Red Hat IT Root CA and vendor GPG keys.
+    These aren't secrets per se, but reveal the build environment.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 8: CA certificates and GPG keys")
+    print(SEPARATOR)
+
+    paths = [
+        "/etc/pki/ca-trust/source/anchors/Red_Hat_IT_Root_CA.pem",
+        "/etc/pki/rpm-gpg/RPM-GPG-KEY-NVIDIA-CUDA-9",
+    ]
+
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            print(f"  FOUND: {path} ({size} bytes)")
+        except (FileNotFoundError, PermissionError) as e:
+            print(f"  NOT FOUND: {path} -> {e}")
+
+
+def probe_build_cache():
+    """Try to access build caches.
+
+    ccache and cargo caches persist across builds. A malicious build
+    could poison these to inject code into future builds.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 9: Build cache access")
+    print(SEPARATOR)
+
+    cache_dirs = [
+        ("/var/cache/builder/ccache", "C/C++ compiler cache"),
+        ("/var/cache/builder/cargo/home", "Rust cargo home"),
+        ("/var/cache/builder/cargo/target", "Rust build target"),
+    ]
+
+    for path, description in cache_dirs:
+        if os.path.isdir(path):
+            try:
+                entries = os.listdir(path)
+                print(f"  PASS (VULNERABLE): {description} at {path} ({len(entries)} entries)")
+            except PermissionError:
+                print(f"  BLOCKED: {description} at {path} -> Permission denied")
+        else:
+            print(f"  NOT FOUND: {description} at {path}")
+
+    # Check if we can write to ccache (cache poisoning)
+    ccache_dir = os.environ.get("CCACHE_DIR", "/var/cache/builder/ccache")
+    if os.path.isdir(ccache_dir):
+        test_file = os.path.join(ccache_dir, ".probe_test")
+        try:
+            with open(test_file, "w") as f:
+                f.write("probe")
+            os.unlink(test_file)
+            print(f"  PASS (VULNERABLE): Can WRITE to ccache dir (cache poisoning possible)")
+        except (PermissionError, OSError) as e:
+            print(f"  BLOCKED: Cannot write to ccache -> {e}")
+
+
+def probe_settings_files():
+    """Try to read package override settings.
+
+    Settings files contain per-package build configuration including
+    environment variables passed to builds.
+    """
+    print(f"\n{SEPARATOR}")
+    print("PROBE 10: Package settings access")
+    print(SEPARATOR)
+
+    settings_dirs = [
+        "/work/overrides/settings",
+        "/work/overrides",
+    ]
+
+    for d in settings_dirs:
+        if os.path.isdir(d):
+            try:
+                entries = os.listdir(d)
+                yaml_files = [e for e in entries if e.endswith(".yaml")]
+                print(f"  FOUND: {d} ({len(yaml_files)} yaml files)")
+                for f in yaml_files[:5]:
+                    print(f"    - {f}")
+                if len(yaml_files) > 5:
+                    print(f"    ... ({len(yaml_files) - 5} more)")
+            except PermissionError:
+                print(f"  BLOCKED: {d} -> Permission denied")
+        else:
+            print(f"  NOT FOUND: {d}")
+
+
 def run_all_probes():
     """Run all security probes."""
     print("\n")
     print("#" * 60)
     print("# BUILD-TIME SECURITY PROBE")
     print("# This runs during build_sdist / build_wheel")
+    print(f"# Python: {sys.version}")
+    print(f"# Platform: {sys.platform}")
     print("#" * 60)
 
     probe_uid()
@@ -189,9 +339,12 @@ def run_all_probes():
     probe_processes()
     probe_ipc()
     probe_hostname()
+    probe_ca_certs()
+    probe_build_cache()
+    probe_settings_files()
 
     print(f"\n{SEPARATOR}")
-    print("PROBES COMPLETE")
+    print("ALL PROBES COMPLETE")
     print(SEPARATOR)
     print()
 
