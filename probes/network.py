@@ -1,8 +1,19 @@
 """Probe 3: Network access."""
 
 import socket
+import concurrent.futures
 
 from . import SEPARATOR
+
+DNS_TIMEOUT = 5  # seconds
+
+
+def _resolve(host, port=443):
+    """DNS resolve with a timeout (getaddrinfo has no timeout param)."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(socket.getaddrinfo, host, port)
+        result = future.result(timeout=DNS_TIMEOUT)
+        return result[0][4][0]
 
 
 def run():
@@ -11,13 +22,16 @@ def run():
     print(SEPARATOR)
 
     # DNS resolution
-    try:
-        addr = socket.getaddrinfo("pypi.org", 443)[0][4][0]
-        print(f"  PASS (VULNERABLE): DNS resolved pypi.org -> {addr}")
-    except (socket.gaierror, OSError) as e:
-        print(f"  BLOCKED: DNS resolution failed -> {e}")
+    for host in ["pypi.org", "gitlab.com"]:
+        try:
+            addr = _resolve(host)
+            print(f"  PASS (VULNERABLE): DNS resolved {host} -> {addr}")
+        except concurrent.futures.TimeoutError:
+            print(f"  BLOCKED: {host} DNS timed out ({DNS_TIMEOUT}s)")
+        except (socket.gaierror, OSError) as e:
+            print(f"  BLOCKED: {host} DNS failed -> {e}")
 
-    # TCP connection (short timeout to avoid hanging)
+    # TCP connection
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
@@ -26,10 +40,3 @@ def run():
         print("  PASS (VULNERABLE): TCP connection to 8.8.8.8:53 succeeded")
     except (ConnectionRefusedError, OSError) as e:
         print(f"  BLOCKED: TCP connection failed -> {e}")
-
-    # GitLab DNS
-    try:
-        addr = socket.getaddrinfo("gitlab.com", 443)[0][4][0]
-        print(f"  PASS (VULNERABLE): DNS resolved gitlab.com -> {addr}")
-    except (socket.gaierror, OSError) as e:
-        print(f"  BLOCKED: gitlab.com DNS failed -> {e}")
